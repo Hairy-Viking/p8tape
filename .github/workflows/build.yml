@@ -1,0 +1,122 @@
+# Builds stand-alone p8tape programs for Windows and Linux.
+# Run it from the Actions tab ("Run workflow"), or push a tag like v1.0 to
+# also attach the programs to a GitHub release.
+#
+# The Linux program is built on AlmaLinux 8 (glibc 2.28), so it runs on
+# Linux distributions from 2019 onwards: Ubuntu/Pop!_OS 20.04+, Debian 10+,
+# Mint 20+, RHEL/Alma/Rocky 8+, Fedora 29+, and current Arch and openSUSE.
+# It is then tested on several of them before being published.
+name: Build p8tape
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: python -m pip install pyinstaller numpy pillow sounddevice
+
+      - name: Build
+        run: >
+          pyinstaller --onefile --windowed --name p8tape
+          --add-data "loader.p8;."
+          --hidden-import sounddevice
+          p8tape.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p8tape-windows
+          path: dist/p8tape.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    # an old base system, so the program runs on older distributions too
+    container: almalinux:8
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y python3.12 python3.12-pip python3.12-tkinter binutils git findutils
+          dnf install -y portaudio || (dnf install -y epel-release && dnf install -y portaudio)
+
+      - uses: actions/checkout@v4
+
+      - name: Install Python packages
+        run: python3.12 -m pip install pyinstaller numpy pillow sounddevice
+
+      - name: Build
+        run: |
+          cp -L /usr/lib64/libportaudio.so.2 ./libportaudio.so.2
+          python3.12 -m PyInstaller --onefile --name p8tape-linux \
+            --add-data "loader.p8:." \
+            --add-binary "libportaudio.so.2:." \
+            --hidden-import sounddevice \
+            p8tape.py
+
+      - name: Check it runs here (the oldest system)
+        run: ./dist/p8tape-linux --help > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p8tape-linux
+          path: dist/p8tape-linux
+
+  # Run the Linux program on several distributions, old and new: make a tape
+  # from a test cart and load it back, checking the cart comes back exactly.
+  test-linux:
+    needs: linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - almalinux:8
+          - debian:10
+          - ubuntu:20.04
+          - debian:11
+          - ubuntu:24.04
+          - fedora:latest
+          - archlinux:latest
+    container: ${{ matrix.distro }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: p8tape-linux
+
+      - name: Make a tape and load it back
+        shell: sh
+        run: |
+          chmod +x p8tape-linux
+          ./p8tape-linux --help > /dev/null
+          head -c 3000 /dev/urandom > test.p8
+          ./p8tape-linux encode test.p8 --speed turbo -o test.wav
+          mkdir out
+          ./p8tape-linux decode test.wav --out out
+          [ "$(sha256sum < test.p8)" = "$(sha256sum < out/tape_test.p8)" ]
+          echo "OK on ${{ matrix.distro }}"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux, test-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
